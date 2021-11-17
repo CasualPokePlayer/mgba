@@ -10,6 +10,7 @@
 #include "mgba/internal/gba/gba.h"
 #include "mgba/internal/gba/video.h"
 #include "mgba/internal/gba/overrides.h"
+#include "mgba/internal/gba/sio/lockstep.h"
 #include "mgba/internal/arm/isa-inlines.h"
 #include "mgba/debugger/debugger.h"
 #include "mgba-util/common.h"
@@ -53,6 +54,7 @@ typedef struct
 	struct GBALuminanceSource lumasource;
 	struct mDebugger debugger;
 	struct GBACartridgeOverride override;
+	struct GBASIOLockstepNode node;
 	int16_t tiltx;
 	int16_t tilty;
 	int16_t tiltz;
@@ -309,6 +311,8 @@ EXP bizctx* BizCreate(const void* bios, const void* data, int length, const over
 	ctx->override.hardware |= dbinfo->hardware & 64; // gb player detect
 	ctx->override.idleLoop = dbinfo->idleLoop;
 
+	memset(&ctx->node, 0, sizeof(ctx->node));
+
 	mDebuggerAttach(&ctx->debugger, ctx->core);
 	ctx->debugger.custom = exec_hook;
 	ctx->debugger.entered = watchpoint_entry;
@@ -316,7 +320,6 @@ EXP bizctx* BizCreate(const void* bios, const void* data, int length, const over
 	resetinternal(ctx);
 	return ctx;
 }
-
 EXP void BizReset(bizctx* ctx)
 {
 	resetinternal(ctx);
@@ -329,6 +332,18 @@ static void blit(uint32_t* dst, const color_t* src, const uint32_t* palette)
 	while (dst < dst_end)
 	{
 		*dst++ = palette[*src++];
+	}
+}
+
+static void linkedblit(uint32_t* dst, const color_t* src, const uint32_t* palette, const int numcores)
+{
+	const int dstwidth = GBA_VIDEO_HORIZONTAL_PIXELS * numcores;
+	for (int i = 0; i < GBA_VIDEO_VERTICAL_PIXELS; i++)
+	{
+		for (int j = 0; j < GBA_VIDEO_HORIZONTAL_PIXELS; j++)
+		{
+			dst[i * dstwidth + j] = palette[src[i * GBA_VIDEO_HORIZONTAL_PIXELS + j]];
+		}
 	}
 }
 
@@ -348,6 +363,81 @@ EXP int BizAdvance(bizctx* ctx, uint16_t keys, uint32_t* vbuff, int* nsamp, int1
 	mDebuggerRunFrame(&ctx->debugger);
 
 	blit(vbuff, ctx->vbuff, ctx->palette);
+	*nsamp = blip_samples_avail(ctx->core->getAudioChannel(ctx->core, 0));
+	if (*nsamp > 1024)
+		*nsamp = 1024;
+	blip_read_samples(ctx->core->getAudioChannel(ctx->core, 0), sbuff, 1024, true);
+	blip_read_samples(ctx->core->getAudioChannel(ctx->core, 1), sbuff + 1, 1024, true);
+	return ctx->lagged;
+}
+
+static bool dummywait(struct mLockstep*, unsigned mask) { return true; }
+static bool dummysignal(struct mLockstep*, unsigned mask) { return true; }
+static void dummyaddCycles(struct mLockstep*, int id, int32_t cycles) {}
+static int32_t dummyunusedCycles(struct mLockstep*, int id, int32_t cycles) { return 0; }
+static int32_t dummyuseCycles(struct mLockstep*, int id, int32_t cycles) { return 0; }
+static void dummyunload(struct mLockstep*, int id) {}
+
+EXP struct GBASIOLockstep* BizCreateLockstep()
+{
+	struct GBASIOLockstep* lockstep = malloc(sizeof(struct GBASIOLockstep));
+	GBASIOLockstepInit(lockstep);
+	mLockstepInit(&lockstep->d);
+	lockstep->d.wait = dummywait;
+	lockstep->d.signal = dummysignal;
+	lockstep->d.addCycles = dummyaddCycles;
+	lockstep->d.unusedCycles = dummyunusedCycles;
+	lockstep->d.useCycles = dummyuseCycles;
+	lockstep->d.unload = dummyunload;
+	return lockstep;
+}
+
+EXP void BizDestroyLockstep(struct GBASIOLockstep* lockstep)
+{
+	free(lockstep);
+}
+
+EXP void BizConnectLinkCable(bizctx* ctx, struct GBASIOLockstep* lockstep)
+{
+	GBASIOLockstepNodeCreate(&ctx->node);
+	GBASIOLockstepAttachNode(lockstep, &ctx->node);
+	GBASIOSetDriver(&ctx->gba->sio, &ctx->node.d, SIO_MULTI);
+	GBASIOSetDriver(&ctx->gba->sio, &ctx->node.d, SIO_NORMAL_32);
+}
+
+EXP void BizStepPrep(bizctx* ctx, uint16_t keys, int64_t time, int16_t gyrox, int16_t gyroy, int16_t gyroz, uint8_t luma)
+{
+	ctx->core->setKeys(ctx->core, keys);
+	ctx->keys = keys;
+	ctx->light = luma;
+	ctx->time = time;
+	ctx->tiltx = gyrox;
+	ctx->tilty = gyroy;
+	ctx->tiltz = gyroz;
+	ctx->lagged = true;
+	//ctx->debugger.state = ctx->trace_callback || ctx->exec_callback ? DEBUGGER_CALLBACK : DEBUGGER_RUNNING;
+	//probably won't support these for now
+}
+
+EXP int BizStep(bizctx* ctx, int cycles, uint32_t* vbuff, int numcores)
+{
+	uint64_t target = mTimingGlobalTime(ctx->core->timing) + cycles;
+	int32_t frame = ctx->core->frameCounter(ctx->core);
+	bool hasBlit = false;
+	while (target > mTimingGlobalTime(ctx->core->timing))
+	{
+		ctx->core->step(ctx->core);
+		if (!hasBlit && frame != ctx->core->frameCounter(ctx->core))
+		{
+			linkedblit(vbuff, ctx->vbuff, ctx->palette, numcores);
+			hasBlit = true;
+		}
+	}
+	return mTimingGlobalTime(ctx->core->timing) - target;
+}
+
+EXP int BizStepPost(bizctx* ctx, int* nsamp, int16_t* sbuff)
+{
 	*nsamp = blip_samples_avail(ctx->core->getAudioChannel(ctx->core, 0));
 	if (*nsamp > 1024)
 		*nsamp = 1024;
